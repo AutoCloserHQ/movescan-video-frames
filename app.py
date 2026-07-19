@@ -2,9 +2,7 @@ import os
 import uuid
 import base64
 import shutil
-import smtplib
 import subprocess
-from email.message import EmailMessage
 from pathlib import Path
 from typing import List, Optional
 
@@ -19,7 +17,7 @@ app = FastAPI(title="MoveScan Video Frame Extractor")
 
 # ---------------------------------------------------------
 # CORS
-# Allows the MoveScan website to call the Render alert route
+# Allows the MoveScan survey website to call Render
 # ---------------------------------------------------------
 
 app.add_middleware(
@@ -35,7 +33,7 @@ app.add_middleware(
 
 
 # ---------------------------------------------------------
-# MODELS
+# REQUEST MODELS
 # ---------------------------------------------------------
 
 class ExtractRequest(BaseModel):
@@ -76,8 +74,8 @@ def health_check():
 
 
 # ---------------------------------------------------------
-# MOVESCAN SUBMISSION EMAIL ALERT
-# This does not extract frames or run OpenAI.
+# MOVESCAN SUBMISSION SMS ALERT
+# Does not extract frames or run OpenAI
 # ---------------------------------------------------------
 
 @app.post("/submission-alert")
@@ -89,13 +87,17 @@ def submission_alert(payload: VideoSubmission):
         )
 
     try:
-        send_submission_email(payload)
+        telnyx_response = send_submission_text(payload)
 
         return {
             "success": True,
-            "message": "MoveScan submission alert sent",
+            "message": "MoveScan submission text alert sent",
             "customer": payload.name,
-            "video_count": len(payload.videos)
+            "video_count": len(payload.videos),
+            "telnyx_message_id": telnyx_response.get(
+                "data",
+                {}
+            ).get("id")
         }
 
     except HTTPException:
@@ -106,96 +108,107 @@ def submission_alert(payload: VideoSubmission):
 
         raise HTTPException(
             status_code=500,
-            detail="Could not send MoveScan submission alert"
+            detail="Could not send MoveScan submission text alert"
         )
 
 
-def send_submission_email(payload: VideoSubmission):
-    smtp_email = os.getenv("SMTP_EMAIL")
-    smtp_app_password = os.getenv("SMTP_APP_PASSWORD")
-    alert_email = os.getenv("ALERT_EMAIL", smtp_email)
+def send_submission_text(payload: VideoSubmission):
+    telnyx_api_key = os.getenv("TELNYX_API_KEY")
+    telnyx_from_number = os.getenv("TELNYX_FROM_NUMBER")
+    alert_phone_number = os.getenv("ALERT_PHONE_NUMBER")
 
-    if not smtp_email:
-        raise RuntimeError("SMTP_EMAIL environment variable is missing")
-
-    if not smtp_app_password:
+    if not telnyx_api_key:
         raise RuntimeError(
-            "SMTP_APP_PASSWORD environment variable is missing"
+            "TELNYX_API_KEY environment variable is missing"
         )
 
-    if not alert_email:
-        raise RuntimeError("ALERT_EMAIL environment variable is missing")
+    if not telnyx_from_number:
+        raise RuntimeError(
+            "TELNYX_FROM_NUMBER environment variable is missing"
+        )
+
+    if not alert_phone_number:
+        raise RuntimeError(
+            "ALERT_PHONE_NUMBER environment variable is missing"
+        )
 
     company_name = get_company_name(payload.client_code)
-
-    room_lines = []
-
-    for index, video in enumerate(payload.videos, start=1):
-        room_name = video.room_label or video.room_key or f"Room {index}"
-        room_lines.append(f"{index}. {room_name}")
-
-    rooms_text = "\n".join(room_lines)
+    video_count = len(payload.videos)
 
     move_date = payload.move_date or "Not provided"
-    from_zip = payload.from_zip or "Not provided"
-    to_zip = payload.to_zip or "Not provided"
-    submitted_at = payload.submitted_at or "Not provided"
+    from_zip = payload.from_zip or "N/A"
+    to_zip = payload.to_zip or "N/A"
 
-    subject = (
-        f"New MoveScan Submitted — {payload.name} "
-        f"({len(payload.videos)} Videos)"
+    text_message = (
+        f"New MoveScan submitted.\n"
+        f"Customer: {payload.name}\n"
+        f"Company: {company_name}\n"
+        f"Videos: {video_count}\n"
+        f"Route: {from_zip} to {to_zip}\n"
+        f"Move date: {move_date}\n"
+        f"Open Make and run the queued Video MoveScan workflow."
     )
 
-    body = f"""
-A new MoveScan video survey has been submitted and is waiting in Make.
+    response = requests.post(
+        "https://api.telnyx.com/v2/messages",
+        headers={
+            "Authorization": f"Bearer {telnyx_api_key}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "from": normalize_phone_number(telnyx_from_number),
+            "to": normalize_phone_number(alert_phone_number),
+            "text": text_message,
+        },
+        timeout=30,
+    )
 
-CUSTOMER
-Name: {payload.name}
-Email: {payload.email}
-Phone: {payload.phone}
+    if response.status_code not in (200, 201, 202):
+        print(
+            "Telnyx SMS error:",
+            response.status_code,
+            response.text
+        )
 
-MOVE INFORMATION
-Move Date: {move_date}
-From ZIP: {from_zip}
-To ZIP: {to_zip}
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Telnyx rejected the SMS request. "
+                f"Status: {response.status_code}. "
+                f"Response: {response.text[:500]}"
+            )
+        )
 
-SURVEY
-Company: {company_name}
-Client Code: {payload.client_code or "default"}
-Survey Type: {payload.survey_type or "Video"}
-Videos Submitted: {len(payload.videos)}
+    return response.json()
 
-ROOMS SUBMITTED
-{rooms_text}
 
-Submitted At: {submitted_at}
-Submission Page: {payload.page_url or "Not provided"}
+def normalize_phone_number(phone_number: str) -> str:
+    cleaned = (
+        phone_number
+        .replace(" ", "")
+        .replace("-", "")
+        .replace("(", "")
+        .replace(")", "")
+    )
 
-NEXT STEP
-Go to the MoveScan Video scenario in Make and manually run the queued submission.
+    if cleaned.startswith("+"):
+        return cleaned
 
-This email is only a submission alert. Video frame extraction and AI processing have not been started.
-""".strip()
+    if len(cleaned) == 10:
+        return f"+1{cleaned}"
 
-    message = EmailMessage()
-    message["Subject"] = subject
-    message["From"] = f"AutoCloser MoveScan <{smtp_email}>"
-    message["To"] = alert_email
-    message.set_content(body)
+    if len(cleaned) == 11 and cleaned.startswith("1"):
+        return f"+{cleaned}"
 
-    clean_password = smtp_app_password.replace(" ", "")
-
-    with smtplib.SMTP_SSL(
-        "smtp.gmail.com",
-        465,
-        timeout=30
-    ) as smtp:
-        smtp.login(smtp_email, clean_password)
-        smtp.send_message(message)
+    raise ValueError(
+        f"Invalid phone number format: {phone_number}"
+    )
 
 
 def get_company_name(client_code: Optional[str]) -> str:
-    normalized_code = (client_code or "default").strip().lower()
+    normalized_code = (
+        client_code or "default"
+    ).strip().lower()
 
     company_names = {
         "modelmoving": "Model Moving",
@@ -237,11 +250,14 @@ def extract_frames(payload: ExtractRequest):
     video_path = work_dir / "input_video.mp4"
 
     try:
-        # 1. Download video
-        download_video(payload.video_url, video_path)
+        download_video(
+            payload.video_url,
+            video_path
+        )
 
-        # 2. Get video duration
-        duration = get_video_duration(video_path)
+        duration = get_video_duration(
+            video_path
+        )
 
         if duration <= 0:
             raise HTTPException(
@@ -254,18 +270,22 @@ def extract_frames(payload: ExtractRequest):
                 status_code=400,
                 detail=(
                     "Video is too long. "
-                    "Max allowed is 30 seconds for this endpoint."
+                    "Max allowed is 30 seconds."
                 )
             )
 
-        # 3. Create frame timestamps
-        timestamps = build_timestamps(duration, frame_count)
+        timestamps = build_timestamps(
+            duration,
+            frame_count
+        )
 
-        # 4. Extract frames
         frames = []
 
         for index, timestamp in enumerate(timestamps):
-            frame_path = work_dir / f"frame_{index + 1}.jpg"
+            frame_path = (
+                work_dir /
+                f"frame_{index + 1}.jpg"
+            )
 
             extract_single_frame(
                 video_path=video_path,
@@ -276,17 +296,29 @@ def extract_frames(payload: ExtractRequest):
             if not frame_path.exists():
                 raise HTTPException(
                     status_code=500,
-                    detail=f"Frame {index + 1} was not created"
+                    detail=(
+                        f"Frame {index + 1} "
+                        "was not created"
+                    )
                 )
 
-            image_base64 = encode_image_base64(frame_path)
+            image_base64 = encode_image_base64(
+                frame_path
+            )
 
             frames.append({
                 "frame_number": index + 1,
-                "position": get_position_label(index, frame_count),
-                "timestamp_seconds": round(timestamp, 2),
+                "position": get_position_label(
+                    index,
+                    frame_count
+                ),
+                "timestamp_seconds": round(
+                    timestamp,
+                    2
+                ),
                 "image_base64": (
-                    f"data:image/jpeg;base64,{image_base64}"
+                    "data:image/jpeg;base64,"
+                    f"{image_base64}"
                 )
             })
 
@@ -307,10 +339,16 @@ def extract_frames(payload: ExtractRequest):
         )
 
     finally:
-        shutil.rmtree(work_dir, ignore_errors=True)
+        shutil.rmtree(
+            work_dir,
+            ignore_errors=True
+        )
 
 
-def download_video(video_url: str, video_path: Path):
+def download_video(
+    video_url: str,
+    video_path: Path
+):
     response = requests.get(
         video_url,
         stream=True,
@@ -333,27 +371,34 @@ def download_video(video_url: str, video_path: Path):
         for chunk in response.iter_content(
             chunk_size=1024 * 1024
         ):
-            if chunk:
-                downloaded += len(chunk)
+            if not chunk:
+                continue
 
-                if downloaded > max_bytes:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=(
-                            "Video file is too large. "
-                            "Max allowed is 100 MB."
-                        )
+            downloaded += len(chunk)
+
+            if downloaded > max_bytes:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Video file is too large. "
+                        "Max allowed is 100 MB."
                     )
+                )
 
-                file.write(chunk)
+            file.write(chunk)
 
 
-def get_video_duration(video_path: Path) -> float:
+def get_video_duration(
+    video_path: Path
+) -> float:
     command = [
         "ffprobe",
-        "-v", "error",
-        "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
         str(video_path)
     ]
 
@@ -366,19 +411,33 @@ def get_video_duration(video_path: Path) -> float:
     if result.returncode != 0:
         raise HTTPException(
             status_code=500,
-            detail=f"ffprobe error: {result.stderr}"
+            detail=(
+                f"ffprobe error: "
+                f"{result.stderr}"
+            )
         )
 
     return float(result.stdout.strip())
 
 
-def build_timestamps(duration: float, frame_count: int):
+def build_timestamps(
+    duration: float,
+    frame_count: int
+):
     if frame_count == 1:
-        return [max(0.5, duration / 2)]
+        return [
+            max(0.5, duration / 2)
+        ]
 
-    # Avoid exact beginning and ending because they can be blank.
-    start = min(1.0, duration * 0.10)
-    end = max(duration - 1.0, duration * 0.90)
+    start = min(
+        1.0,
+        duration * 0.10
+    )
+
+    end = max(
+        duration - 1.0,
+        duration * 0.90
+    )
 
     if frame_count == 5:
         return [
@@ -389,7 +448,11 @@ def build_timestamps(duration: float, frame_count: int):
             end
         ]
 
-    step = (end - start) / (frame_count - 1)
+    step = (
+        end - start
+    ) / (
+        frame_count - 1
+    )
 
     return [
         start + (step * index)
@@ -405,11 +468,16 @@ def extract_single_frame(
     command = [
         "ffmpeg",
         "-y",
-        "-ss", str(timestamp),
-        "-i", str(video_path),
-        "-frames:v", "1",
-        "-vf", "scale='min(1024,iw)':-2",
-        "-q:v", "3",
+        "-ss",
+        str(timestamp),
+        "-i",
+        str(video_path),
+        "-frames:v",
+        "1",
+        "-vf",
+        "scale='min(1024,iw)':-2",
+        "-q:v",
+        "3",
         str(output_path)
     ]
 
@@ -422,12 +490,20 @@ def extract_single_frame(
     if result.returncode != 0:
         raise HTTPException(
             status_code=500,
-            detail=f"ffmpeg error: {result.stderr}"
+            detail=(
+                f"ffmpeg error: "
+                f"{result.stderr}"
+            )
         )
 
 
-def encode_image_base64(image_path: Path) -> str:
-    with open(image_path, "rb") as image_file:
+def encode_image_base64(
+    image_path: Path
+) -> str:
+    with open(
+        image_path,
+        "rb"
+    ) as image_file:
         return base64.b64encode(
             image_file.read()
         ).decode("utf-8")
