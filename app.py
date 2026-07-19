@@ -75,6 +75,7 @@ def health_check():
 
 # ---------------------------------------------------------
 # MOVESCAN SUBMISSION SMS ALERT
+# Uses ClickSend HTTPS API
 # Does not extract frames or run OpenAI
 # ---------------------------------------------------------
 
@@ -87,17 +88,14 @@ def submission_alert(payload: VideoSubmission):
         )
 
     try:
-        telnyx_response = send_submission_text(payload)
+        clicksend_response = send_submission_text(payload)
 
         return {
             "success": True,
             "message": "MoveScan submission text alert sent",
             "customer": payload.name,
             "video_count": len(payload.videos),
-            "telnyx_message_id": telnyx_response.get(
-                "data",
-                {}
-            ).get("id")
+            "clicksend_response": clicksend_response
         }
 
     except HTTPException:
@@ -113,18 +111,18 @@ def submission_alert(payload: VideoSubmission):
 
 
 def send_submission_text(payload: VideoSubmission):
-    telnyx_api_key = os.getenv("TELNYX_API_KEY")
-    telnyx_from_number = os.getenv("TELNYX_FROM_NUMBER")
+    clicksend_username = os.getenv("CLICKSEND_USERNAME")
+    clicksend_api_key = os.getenv("CLICKSEND_API_KEY")
     alert_phone_number = os.getenv("ALERT_PHONE_NUMBER")
 
-    if not telnyx_api_key:
+    if not clicksend_username:
         raise RuntimeError(
-            "TELNYX_API_KEY environment variable is missing"
+            "CLICKSEND_USERNAME environment variable is missing"
         )
 
-    if not telnyx_from_number:
+    if not clicksend_api_key:
         raise RuntimeError(
-            "TELNYX_FROM_NUMBER environment variable is missing"
+            "CLICKSEND_API_KEY environment variable is missing"
         )
 
     if not alert_phone_number:
@@ -149,23 +147,32 @@ def send_submission_text(payload: VideoSubmission):
         f"Open Make and run the queued Video MoveScan workflow."
     )
 
+    request_body = {
+        "messages": [
+            {
+                "source": "MoveScan",
+                "body": text_message,
+                "to": normalize_phone_number(alert_phone_number)
+            }
+        ]
+    }
+
     response = requests.post(
-        "https://api.telnyx.com/v2/messages",
+        "https://rest.clicksend.com/v3/sms/send",
+        auth=(
+            clicksend_username,
+            clicksend_api_key
+        ),
         headers={
-            "Authorization": f"Bearer {telnyx_api_key}",
-            "Content-Type": "application/json",
+            "Content-Type": "application/json"
         },
-        json={
-            "from": normalize_phone_number(telnyx_from_number),
-            "to": normalize_phone_number(alert_phone_number),
-            "text": text_message,
-        },
-        timeout=30,
+        json=request_body,
+        timeout=30
     )
 
     if response.status_code not in (200, 201, 202):
         print(
-            "Telnyx SMS error:",
+            "ClickSend SMS error:",
             response.status_code,
             response.text
         )
@@ -173,13 +180,29 @@ def send_submission_text(payload: VideoSubmission):
         raise HTTPException(
             status_code=502,
             detail=(
-                "Telnyx rejected the SMS request. "
+                "ClickSend rejected the SMS request. "
                 f"Status: {response.status_code}. "
                 f"Response: {response.text[:500]}"
             )
         )
 
-    return response.json()
+    response_data = response.json()
+
+    if response_data.get("response_code") != "SUCCESS":
+        print(
+            "ClickSend response error:",
+            response_data
+        )
+
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "ClickSend returned a non-success response. "
+                f"Response: {str(response_data)[:500]}"
+            )
+        )
+
+    return response_data
 
 
 def normalize_phone_number(phone_number: str) -> str:
