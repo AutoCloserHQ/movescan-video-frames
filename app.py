@@ -288,12 +288,12 @@ def extract_frames(payload: ExtractRequest):
                 detail="Could not read video duration"
             )
 
-        if duration > 30:
+        if duration > 120:
             raise HTTPException(
                 status_code=400,
                 detail=(
                     "Video is too long. "
-                    "Max allowed is 30 seconds."
+                    "Max allowed is 120 seconds."
                 )
             )
 
